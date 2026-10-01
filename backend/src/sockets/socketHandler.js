@@ -1,241 +1,190 @@
-const {
-  activeRiders,
-  activeOrders
-} = require("../store/memoryStore");
+const allocateRider = require("../services/allocationService");
 
-const allocateRider =
-  require("../services/allocationService");
+const {
+  setRider,
+  updateRiderFields,
+  deleteRider,
+  getRider,
+  getRiderIdBySocketId
+} = require("../store/riderStore");
+
+const {
+  setOrder,
+  updateOrder,
+  getOrder
+} = require("../store/orderStore");
+
+const {
+  indexRider,
+  removeRider
+} = require("../store/h3Store");
 
 function socketHandler(io) {
 
-  io.on(
-    "connection",
-    (socket) => {
+  io.on("connection", (socket) => {
 
-      console.log(
-        "Connected:",
-        socket.id
-      );
+    console.log("Connected:", socket.id);
 
-      socket.on(
-        "location-update",
-        ({
-          riderId,
-          latitude,
-          longitude
-        }) => {
+    // ── location-update ───────────────────────────────────────────────────────
+    socket.on(
+      "location-update",
+      async ({ riderId, latitude, longitude }) => {
 
-          activeRiders[
-            riderId
-          ] = {
+        try {
+          // Fetch existing availability so we don't overwrite it on a re-ping
+          const existing = await getRider(riderId);
+          const available = existing ? existing.available : true;
 
-            socketId:
-              socket.id,
-
+          // Persist to Redis
+          await setRider(riderId, {
+            socketId:    socket.id,
             latitude,
-
             longitude,
+            available,
+            lastUpdated: Date.now()
+          });
 
-            available:
-              activeRiders[
-                riderId
-              ]?.available ?? true,
+          // Keep H3 in-memory index in sync
+          indexRider(riderId, latitude, longitude);
 
-            lastUpdated:
-              Date.now()
+          console.log("\n====== RIDER UPDATE ======");
+          console.log("Rider:",     riderId);
+          console.log("Latitude:",  latitude);
+          console.log("Longitude:", longitude);
+          console.log("==========================");
 
-          };
-
-          console.log(
-            "\n====== RIDER UPDATE ======"
-          );
-
-          console.log(
-            "Rider:",
-            riderId
-          );
-
-          console.log(
-            "Latitude:",
-            latitude
-          );
-
-          console.log(
-            "Longitude:",
-            longitude
-          );
-
-          console.log(
-            "Total Riders:",
-            Object.keys(
-              activeRiders
-            ).length
-          );
-
-          console.log(
-            "=========================="
-          );
-
+        } catch (err) {
+          console.error("[location-update] Redis error:", err.message);
         }
-      );
+      }
+    );
 
-      // Handle rider order acceptance/rejection response
-      socket.on(
-        "order-response",
-        ({ orderId, status }) => {
+    // ── order-response ────────────────────────────────────────────────────────
+    socket.on(
+      "order-response",
+      async ({ orderId, status }) => {
 
-          let riderId = null;
-          for (const id in activeRiders) {
-            if (activeRiders[id].socketId === socket.id) {
-              riderId = id;
-              break;
-            }
-          }
+        try {
+          // O(1) reverse lookup: socketId → riderId
+          const riderId = await getRiderIdBySocketId(socket.id);
 
           if (!riderId) {
-            console.log(`\n[Socket Error] Order response received but no active rider found for socket: ${socket.id}`);
+            console.log(
+              `\n[Socket Error] order-response received but no active rider ` +
+              `found for socket: ${socket.id}`
+            );
             return;
           }
 
-          console.log(
-            "\n====== RIDER RESPONSE ======"
-          );
-
-          console.log(
-            "Rider:",
-            riderId
-          );
-
-          console.log(
-            "Order ID:",
-            orderId
-          );
-
-          console.log(
-            "Status:",
-            status
-          );
-
-          console.log(
-            "============================"
-          );
+          console.log("\n====== RIDER RESPONSE ======");
+          console.log("Rider:",    riderId);
+          console.log("Order ID:", orderId);
+          console.log("Status:",   status);
+          console.log("============================");
 
           if (status === "ACCEPTED") {
-            // Mark the order as accepted
-            if (activeOrders[orderId]) {
-              activeOrders[orderId].status = "ACCEPTED";
-            }
+            await updateOrder(orderId, { status: "ACCEPTED" });
             console.log(`\n[Order ${orderId}] Accepted by rider ${riderId}`);
 
           } else if (status === "REJECTED") {
             // Free the rejecting rider
-            if (activeRiders[riderId]) {
-              activeRiders[riderId].available = true;
-            }
+            await updateRiderFields(riderId, { available: true });
 
-            const order = activeOrders[orderId];
+            const order = await getOrder(orderId);
             if (!order) {
-              console.log(`\n[Order ${orderId}] Not found in activeOrders — cannot reassign.`);
+              console.log(
+                `\n[Order ${orderId}] Not found in Redis — cannot reassign.`
+              );
               return;
             }
 
-            // Track all riders who have rejected this order
-            if (!order.rejectedRiders) {
-              order.rejectedRiders = [];
-            }
-            order.rejectedRiders.push(riderId);
+            // Track all riders that rejected this order
+            const rejectedRiders = [...order.rejectedRiders, riderId];
+            await updateOrder(orderId, { rejectedRiders });
 
             console.log(
-              `\n[Order ${orderId}] Rejected by rider ${riderId}. Attempting reassignment...`
+              `\n[Order ${orderId}] Rejected by rider ${riderId}. ` +
+              `Attempting reassignment...`
             );
             console.log(
-              `  Already rejected: [${order.rejectedRiders.join(", ")}]`
+              `  Already rejected: [${rejectedRiders.join(", ")}]`
             );
 
             // Find the next best available rider
-            const { winner, bestDistance } = allocateRider(
+            const { winner, bestDistance } = await allocateRider(
               order.restaurantLat,
               order.restaurantLng,
-              order.rejectedRiders
+              rejectedRiders
             );
 
             if (!winner) {
-              order.status = "NO_RIDER_AVAILABLE";
-              // Notify restaurant dashboard that all riders declined
+              await updateOrder(orderId, { status: "NO_RIDER_AVAILABLE" });
               io.emit("order-no-rider", { orderId });
-              console.log(`\n[Order ${orderId}] No more eligible riders available. Order marked as NO_RIDER_AVAILABLE.`);
+              console.log(
+                `\n[Order ${orderId}] No more eligible riders. ` +
+                `Marked as NO_RIDER_AVAILABLE.`
+              );
               return;
             }
 
             // Assign the new rider
-            activeRiders[winner].available = false;
-            order.riderId = winner;
-            order.status = "ASSIGNED";
+            await updateRiderFields(winner, { available: false });
+            await updateOrder(orderId, { riderId: winner, status: "ASSIGNED" });
 
-            // Notify the new rider via Socket.io
-            const newRiderSocketId = activeRiders[winner].socketId;
-            io.to(newRiderSocketId).emit("new-order", {
-              orderId,
-              restaurantLat: order.restaurantLat,
-              restaurantLng: order.restaurantLng,
-              assignedRider: winner
-            });
+            const winnerRider = await getRider(winner);
+            if (winnerRider) {
+              io.to(winnerRider.socketId).emit("new-order", {
+                orderId,
+                restaurantLat: order.restaurantLat,
+                restaurantLng: order.restaurantLng,
+                assignedRider: winner
+              });
+            }
 
-            // Broadcast reassignment to all clients (e.g. restaurant dashboard)
             io.emit("order-reassigned", {
               orderId,
               assignedRider: winner,
-              distanceKm: bestDistance,
-              rejectedBy: riderId
+              distanceKm:    bestDistance,
+              rejectedBy:    riderId
             });
 
             console.log(
-              `\n[Order ${orderId}] Reassigned to rider ${winner} (distance: ${bestDistance.toFixed(2)} km)`
+              `\n[Order ${orderId}] Reassigned to rider ${winner} ` +
+              `(distance: ${bestDistance.toFixed(2)} km)`
             );
           }
 
+        } catch (err) {
+          console.error("[order-response] Redis error:", err.message);
         }
-      );
+      }
+    );
 
-      socket.on(
-        "disconnect",
-        () => {
+    // ── disconnect ────────────────────────────────────────────────────────────
+    socket.on("disconnect", async () => {
 
-          console.log(
-            `Disconnected: ${socket.id}`
-          );
+      console.log(`Disconnected: ${socket.id}`);
 
-          for (
-            const riderId
-            in activeRiders
-          ) {
+      try {
+        const riderId = await getRiderIdBySocketId(socket.id);
 
-            if (
-              activeRiders[
-                riderId
-              ].socketId ===
-              socket.id
-            ) {
+        if (riderId) {
+          // Remove from H3 in-memory index
+          removeRider(riderId);
 
-              delete activeRiders[
-                riderId
-              ];
+          // Remove from Redis
+          await deleteRider(riderId);
 
-              console.log(
-                `Removed Rider: ${riderId}`
-              );
-
-            }
-
-          }
-
+          console.log(`Removed Rider: ${riderId}`);
         }
-      );
+      } catch (err) {
+        console.error("[disconnect] Redis error:", err.message);
+      }
 
-    }
-  );
+    });
+
+  });
 
 }
 
-module.exports =
-  socketHandler;
+module.exports = socketHandler;

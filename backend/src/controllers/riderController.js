@@ -1,6 +1,4 @@
-const {
-  activeRiders
-} = require("../store/memoryStore");
+const { getAllRiders } = require("../store/riderStore");
 
 const getRiderPage = (req, res) => {
 
@@ -499,16 +497,17 @@ function hideOrderCard() {
 
 };
 
-const getActiveRiders = (req, res) => {
-
-  res.json({
-    totalRiders:
-      Object.keys(activeRiders).length,
-
-    riders:
-      activeRiders
-  });
-
+const getActiveRiders = async (req, res) => {
+  try {
+    const riders = await getAllRiders();
+    res.json({
+      totalRiders: Object.keys(riders).length,
+      riders
+    });
+  } catch (err) {
+    console.error("[getActiveRiders] Redis error:", err.message);
+    res.status(500).json({ message: "Failed to fetch riders" });
+  }
 };
 
 module.exports = {
